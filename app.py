@@ -5,16 +5,18 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageDraw
 import pytesseract
 
+
 # ----------------------------
 # Config
 # ----------------------------
 st.set_page_config(page_title="Unir PDFs + Firma opcional", page_icon="📄", layout="centered")
 
-APP_TITLE = "📄 Unir PDFs + ✍️ Firma opcional (firma arriba del nombre)"
+APP_TITLE = "📄 Unir PDFs + ✍️ Firma opcional (firma arriba del nombre y movible)"
 TARGET_DEFAULT = "Lennin Karina Triana Fandiño"
 
+
 # ----------------------------
-# Session State init
+# Session State
 # ----------------------------
 def init_state():
     if "merged_pdf_bytes" not in st.session_state:
@@ -25,7 +27,7 @@ def init_state():
     if "det_page" not in st.session_state:
         st.session_state.det_page = None
     if "det_rect" not in st.session_state:
-        st.session_state.det_rect = None  # tuple (x0,y0,x1,y1)
+        st.session_state.det_rect = None  # (x0,y0,x1,y1) en coords PDF
     if "det_method" not in st.session_state:
         st.session_state.det_method = None
 
@@ -34,7 +36,25 @@ def init_state():
     if "last_target" not in st.session_state:
         st.session_state.last_target = TARGET_DEFAULT
 
+    # offsets para mover firma (en puntos PDF)
+    if "sig_dx" not in st.session_state:
+        st.session_state.sig_dx = 0.0
+    if "sig_dy" not in st.session_state:
+        st.session_state.sig_dy = 0.0
+
+
+def reset_all():
+    st.session_state.merged_pdf_bytes = None
+    st.session_state.detected = False
+    st.session_state.det_page = None
+    st.session_state.det_rect = None
+    st.session_state.det_method = None
+    st.session_state.sig_dx = 0.0
+    st.session_state.sig_dy = 0.0
+
+
 init_state()
+
 
 # ----------------------------
 # Helpers
@@ -44,8 +64,9 @@ def normalize(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-def merge_pdfs_with_pymupdf(files_bytes_in_order) -> bytes:
-    """Une PDFs en el orden dado, devuelve bytes."""
+
+def merge_pdfs(files_bytes_in_order) -> bytes:
+    """Une PDFs en el orden dado, devuelve bytes del PDF unido."""
     merged = fitz.open()
     for pdf_bytes in files_bytes_in_order:
         src = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -58,14 +79,16 @@ def merge_pdfs_with_pymupdf(files_bytes_in_order) -> bytes:
     out.seek(0)
     return out.getvalue()
 
+
 def find_name_rect_text(doc: fitz.Document, target_text: str):
     """Busca texto seleccionable. Retorna (page_index, rect) o None."""
     for pi in range(doc.page_count):
         page = doc[pi]
         rects = page.search_for(target_text)
         if rects:
-            return pi, rects[0]  # aparece una vez
+            return pi, rects[0]  # aparece una vez (según tu caso)
     return None
+
 
 def ocr_find_name_rect(doc: fitz.Document, target_text: str, zoom=2.8):
     """
@@ -114,27 +137,46 @@ def ocr_find_name_rect(doc: fitz.Document, target_text: str, zoom=2.8):
 
     return None
 
+
 def render_page_image(page: fitz.Page, zoom=2.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+
 def rect_pdf_to_img(rect_pdf: fitz.Rect, zoom: float):
-    return (int(rect_pdf.x0 * zoom), int(rect_pdf.y0 * zoom),
-            int(rect_pdf.x1 * zoom), int(rect_pdf.y1 * zoom))
+    return (
+        int(rect_pdf.x0 * zoom),
+        int(rect_pdf.y0 * zoom),
+        int(rect_pdf.x1 * zoom),
+        int(rect_pdf.y1 * zoom),
+    )
+
 
 def draw_highlight(img: Image.Image, rect_img, outline_width=6) -> Image.Image:
-    """Rectángulo rojo para mostrar dónde está el nombre."""
+    """Dibuja un rectángulo rojo para mostrar dónde se detectó el nombre."""
     out = img.copy()
     d = ImageDraw.Draw(out)
     d.rectangle(rect_img, outline="red", width=outline_width)
     return out
 
-def draw_signature_preview_above(img: Image.Image, rect_pdf: fitz.Rect, sig_img: Image.Image, zoom: float,
-                                 gap=8, pad=6, scale_w=1.4, scale_h=2.0) -> Image.Image:
+
+def draw_signature_preview_above(
+    img: Image.Image,
+    rect_pdf: fitz.Rect,
+    sig_img: Image.Image,
+    zoom: float,
+    gap=10,
+    pad=6,
+    scale_w=1.4,
+    scale_h=2.0,
+    dx_pdf=0.0,
+    dy_pdf=0.0,
+) -> Image.Image:
     """
-    Preview: firma ARRIBA del nombre (no lo tapa).
-    gap: espacio vertical entre firma y nombre (en px de la imagen renderizada).
+    Preview: firma ARRIBA del nombre (no lo tapa) + desplazamiento manual.
+    gap está en px (de la imagen renderizada).
+    dx_pdf/dy_pdf están en puntos PDF; se convierten a px multiplicando por zoom.
     """
     out = img.copy()
 
@@ -147,29 +189,49 @@ def draw_signature_preview_above(img: Image.Image, rect_pdf: fitz.Rect, sig_img:
     fw = int(name_w * scale_w) + pad * 2
     fh = int(name_h * scale_h) + pad * 2
 
-    # Alineación horizontal centrada
+    # Centrar firma horizontalmente sobre el nombre
     cx = (nx0 + nx1) // 2
-    fx0 = max(0, cx - fw // 2)
+    fx0 = cx - fw // 2
+    fy1 = ny0 - gap          # borde inferior de la firma
+    fy0 = fy1 - fh           # borde superior de la firma
+
+    # Aplicar desplazamiento manual (PDF -> px)
+    dx_px = int(dx_pdf * zoom)
+    dy_px = int(dy_pdf * zoom)
+    fx0 += dx_px
+    fy0 += dy_px
+    fy1 += dy_px
+
+    # Encajar dentro de la imagen
+    fx0 = max(0, min(fx0, out.width - 1))
+    fy0 = max(0, min(fy0, out.height - 1))
     fx1 = min(out.width, fx0 + fw)
+    fy1 = min(out.height, fy0 + fh)
 
-    # Firma encima: su borde inferior queda arriba del nombre - gap
-    fy1 = max(0, ny0 - gap)
-    fy0 = max(0, fy1 - fh)
+    w = max(1, fx1 - fx0)
+    h = max(1, fy1 - fy0)
 
-    # Evitar quedar pegado al borde superior
-    if fy0 == 0 and (fy1 - fy0) < 10:
-        fy1 = min(out.height, max(0, ny0 - 2))
-        fy0 = max(0, fy1 - fh)
-
-    sig = sig_img.convert("RGBA").resize((max(1, fx1 - fx0), max(1, fy1 - fy0)))
+    sig = sig_img.convert("RGBA").resize((w, h))
     out.paste(sig, (fx0, fy0), sig)
     return out
 
-def insert_signature_above_into_pdf(doc: fitz.Document, page_index: int, name_rect: fitz.Rect, sig_bytes: bytes,
-                                    gap=6, pad=4, scale_w=1.4, scale_h=2.0):
+
+def insert_signature_above_into_pdf(
+    doc: fitz.Document,
+    page_index: int,
+    name_rect: fitz.Rect,
+    sig_bytes: bytes,
+    gap=6,          # en puntos PDF
+    pad=4,          # en puntos PDF
+    scale_w=1.4,
+    scale_h=2.0,
+    dx_pdf=0.0,
+    dy_pdf=0.0,
+):
     """
-    Inserta firma ARRIBA del nombre (no lo tapa).
-    gap: espacio vertical entre firma y nombre (en puntos PDF).
+    Inserta firma ARRIBA del nombre (no lo tapa) + desplazamiento manual.
+    dx_pdf: izquierda(-)/derecha(+) en puntos PDF
+    dy_pdf: arriba(-)/abajo(+) en puntos PDF
     """
     page = doc[page_index]
 
@@ -180,14 +242,20 @@ def insert_signature_above_into_pdf(doc: fitz.Document, page_index: int, name_re
     w = name_w * scale_w + pad * 2
     h = name_h * scale_h + pad * 2
 
-    # Centro X alineado al nombre (centrado)
+    # Alineación horizontal centrada con el nombre
     cx = (name_rect.x0 + name_rect.x1) / 2
     x0 = cx - w / 2
     x1 = cx + w / 2
 
-    # Encima del nombre: borde inferior firma = arriba del nombre - gap
+    # Encima del nombre
     y1 = name_rect.y0 - gap
     y0 = y1 - h
+
+    # Aplicar desplazamientos manuales
+    x0 += dx_pdf
+    x1 += dx_pdf
+    y0 += dy_pdf
+    y1 += dy_pdf
 
     # Evitar salir por arriba
     if y0 < 0:
@@ -197,28 +265,22 @@ def insert_signature_above_into_pdf(doc: fitz.Document, page_index: int, name_re
     rect_sig = fitz.Rect(x0, y0, x1, y1)
     page.insert_image(rect_sig, stream=sig_bytes, overlay=True)
 
-def reset_all():
-    st.session_state.merged_pdf_bytes = None
-    st.session_state.detected = False
-    st.session_state.det_page = None
-    st.session_state.det_rect = None
-    st.session_state.det_method = None
 
 # ----------------------------
 # UI
 # ----------------------------
 st.title(APP_TITLE)
 st.write(
-    "✅ **Esencia del app:** unir PDFs.\n\n"
-    "Luego, si el PDF unido contiene el nombre indicado, puedes **firmar opcionalmente**.\n"
-    "La firma se coloca **ARRIBA** del nombre (sin taparlo) y tienes **previsualización** antes de descargar."
+    "✅ **Paso 1:** Unes PDFs.\n\n"
+    "✅ **Paso 2:** Si el PDF unido contiene el nombre, puedes **firmar opcionalmente**.\n"
+    "La firma queda **ARRIBA del nombre** (como tu ejemplo) y puedes **moverla con flechas** antes de confirmar."
 )
 
-colR1, colR2 = st.columns([1, 1])
-with colR1:
-    if st.button("🔄 Reiniciar", help="Borra el PDF unido actual y vuelve al paso 1"):
+top_left, top_right = st.columns([1, 1])
+with top_left:
+    if st.button("🔄 Reiniciar todo"):
         reset_all()
-with colR2:
+with top_right:
     enable_ocr = st.toggle("Usar OCR si viene escaneado", value=True, key="enable_ocr")
 
 uploaded_files = st.file_uploader(
@@ -229,10 +291,11 @@ uploaded_files = st.file_uploader(
 )
 
 target_name = st.text_input(
-    "Nombre a detectar para habilitar firma (exacto)",
+    "Nombre a detectar (exacto) para habilitar firma",
     value=st.session_state.last_target,
     key="target_name"
 )
+
 output_name = st.text_input(
     "Nombre del PDF final",
     value=st.session_state.last_output_name,
@@ -243,19 +306,24 @@ output_name = st.text_input(
 st.session_state.last_target = target_name
 st.session_state.last_output_name = output_name if output_name else "PDF_unido.pdf"
 
-# Paso 1: Unir
 if uploaded_files:
     st.write("**Archivos cargados:**")
     for i, f in enumerate(uploaded_files, start=1):
         st.write(f"{i}. {f.name}")
 
     if st.button("✅ Unir PDFs", type="primary", key="merge_btn"):
+        # Reset offsets cada vez que unes
+        st.session_state.sig_dx = 0.0
+        st.session_state.sig_dy = 0.0
+
         files_bytes = [f.getvalue() for f in uploaded_files]
-        merged_bytes = merge_pdfs_with_pymupdf(files_bytes)
+
+        with st.spinner("Uniendo PDFs..."):
+            merged_bytes = merge_pdfs(files_bytes)
 
         st.session_state.merged_pdf_bytes = merged_bytes
 
-        # Detectar nombre en el PDF unido
+        # Detectar nombre dentro del PDF unido
         doc = fitz.open(stream=merged_bytes, filetype="pdf")
 
         found = find_name_rect_text(doc, target_name)
@@ -263,7 +331,8 @@ if uploaded_files:
 
         if not found and enable_ocr:
             method = "ocr"
-            found_ocr = ocr_find_name_rect(doc, target_name, zoom=2.8)
+            with st.spinner("No hay texto seleccionable. Intentando OCR..."):
+                found_ocr = ocr_find_name_rect(doc, target_name, zoom=2.8)
             if found_ocr:
                 found = found_ocr
 
@@ -280,19 +349,22 @@ if uploaded_files:
             st.session_state.det_method = None
 
         doc.close()
-        st.success("PDFs unidos ✅ (resultado guardado). Baja al Paso 2 para descargar o firmar.")
+        st.success("PDFs unidos ✅ Baja al Paso 2 para descargar o firmar.")
 
-# Paso 2: Descargar / Firmar
+# ----------------------------
+# Paso 2
+# ----------------------------
 if st.session_state.merged_pdf_bytes:
     st.divider()
     st.header("Paso 2: Descargar (y firmar opcionalmente)")
 
     merged_pdf_bytes = st.session_state.merged_pdf_bytes
+    outname = output_name if output_name.lower().endswith(".pdf") else output_name + ".pdf"
 
     st.download_button(
         "⬇️ Descargar PDF unido (sin firma)",
         data=merged_pdf_bytes,
-        file_name=output_name if output_name.lower().endswith(".pdf") else output_name + ".pdf",
+        file_name=outname,
         mime="application/pdf",
         key="dl_merged"
     )
@@ -307,7 +379,6 @@ if st.session_state.merged_pdf_bytes:
 
         preview_zoom = st.slider("Zoom de previsualización", 1.0, 3.5, 2.0, 0.1, key="preview_zoom")
 
-        # Abrir doc desde bytes para preview
         doc = fitz.open(stream=merged_pdf_bytes, filetype="pdf")
         page = doc[st.session_state.det_page]
         rect_pdf = fitz.Rect(*st.session_state.det_rect)
@@ -315,7 +386,7 @@ if st.session_state.merged_pdf_bytes:
         img_page = render_page_image(page, zoom=preview_zoom)
         rect_img = rect_pdf_to_img(rect_pdf, zoom=preview_zoom)
 
-        st.subheader("👀 Previsualización (donde se encontró el nombre)")
+        st.subheader("👀 Previsualización (se marca el nombre detectado)")
         st.image(draw_highlight(img_page, rect_img), use_column_width=True)
 
         wants_sign = st.toggle("✍️ ¿Deseas firmar este documento?", value=False, key="wants_sign")
@@ -323,24 +394,54 @@ if st.session_state.merged_pdf_bytes:
         if wants_sign:
             sig_file = st.file_uploader("Sube la firma (PNG/JPG)", type=["png", "jpg", "jpeg"], key="sig_uploader")
 
-            # Controles firma
-            gap = st.slider("Espacio entre firma y nombre (gap)", 0, 40, 10, key="gap")
+            # Controles de tamaño/espaciado
+            st.markdown("### Ajustes de tamaño y separación")
+            gap = st.slider("Espacio vertical entre firma y nombre (gap)", 0, 40, 10, key="gap")
             pad = st.slider("Margen (padding)", 0, 20, 6, key="pad")
             scale_w = st.slider("Escala ancho firma", 0.8, 2.5, 1.4, 0.1, key="scale_w")
             scale_h = st.slider("Escala alto firma", 0.8, 4.0, 2.0, 0.1, key="scale_h")
 
+            # Controles de movimiento (flechas)
+            st.markdown("### 🎯 Mover firma con flechas")
+            step = st.slider("Paso de movimiento (puntos PDF por clic)", 1, 30, 6, key="move_step")
+
+            c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
+            with c1:
+                if st.button("⬅️", key="btn_left"):
+                    st.session_state.sig_dx -= float(step)
+            with c2:
+                if st.button("➡️", key="btn_right"):
+                    st.session_state.sig_dx += float(step)
+            with c3:
+                if st.button("⬆️", key="btn_up"):
+                    st.session_state.sig_dy -= float(step)
+            with c4:
+                if st.button("⬇️", key="btn_down"):
+                    st.session_state.sig_dy += float(step)
+            with c5:
+                if st.button("Reset", key="btn_reset_move"):
+                    st.session_state.sig_dx = 0.0
+                    st.session_state.sig_dy = 0.0
+
+            st.caption(f"Desplazamiento actual: dx={st.session_state.sig_dx} | dy={st.session_state.sig_dy} (puntos PDF)")
+
             if sig_file:
                 sig_img = Image.open(sig_file).convert("RGBA")
 
-                st.subheader("✅ Preview con firma (firma arriba del nombre)")
-                st.image(
-                    draw_signature_preview_above(
-                        img_page, rect_pdf, sig_img,
-                        zoom=preview_zoom,
-                        gap=gap, pad=pad, scale_w=scale_w, scale_h=scale_h
-                    ),
-                    use_column_width=True
+                st.subheader("✅ Preview con firma (arriba del nombre + movible)")
+                preview_with_sig = draw_signature_preview_above(
+                    img_page,
+                    rect_pdf,
+                    sig_img,
+                    zoom=preview_zoom,
+                    gap=gap,
+                    pad=pad,
+                    scale_w=scale_w,
+                    scale_h=scale_h,
+                    dx_pdf=st.session_state.sig_dx,
+                    dy_pdf=st.session_state.sig_dy,
                 )
+                st.image(preview_with_sig, use_column_width=True)
 
                 if st.button("🔒 Confirmar y generar PDF firmado", type="primary", key="confirm_sign"):
                     doc2 = fitz.open(stream=merged_pdf_bytes, filetype="pdf")
@@ -351,7 +452,12 @@ if st.session_state.merged_pdf_bytes:
                         st.session_state.det_page,
                         rect_pdf2,
                         sig_file.getvalue(),
-                        gap=gap, pad=pad, scale_w=scale_w, scale_h=scale_h
+                        gap=max(0, int(gap / preview_zoom)),  # gap en PDF: aproximación desde px->PDF
+                        pad=pad,
+                        scale_w=scale_w,
+                        scale_h=scale_h,
+                        dx_pdf=st.session_state.sig_dx,
+                        dy_pdf=st.session_state.sig_dy,
                     )
 
                     out = io.BytesIO()
@@ -369,6 +475,7 @@ if st.session_state.merged_pdf_bytes:
                     )
             else:
                 st.warning("Sube la imagen de firma para previsualizar y confirmar.")
+
         doc.close()
 else:
-    st.info("Sube PDFs y haz clic en **Unir PDFs** para continuar.")
+    st.info("Sube PDFs y presiona **Unir PDFs** para continuar.")
