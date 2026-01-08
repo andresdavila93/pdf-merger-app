@@ -11,8 +11,8 @@ import pytesseract
 # ----------------------------
 st.set_page_config(page_title="Unir PDFs + Firma opcional", page_icon="📄", layout="centered")
 
-APP_TITLE = "📄 Unir PDFs + ✍️ Firma opcional (firma arriba del nombre y movible)"
-TARGET_DEFAULT = "Lennin Karina Triana Fandiño"
+APP_TITLE = "📄 Unir PDFs + ✍️ Firma opcional"
+TARGET_DEFAULT = "LENNIN KARINA TRIANA"
 
 
 # ----------------------------
