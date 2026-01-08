@@ -1,2 +1,4 @@
 streamlit
-pypdf
+pymupdf
+pytesseract
+Pillow
