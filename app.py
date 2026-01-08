@@ -324,4 +324,51 @@ if st.session_state.merged_pdf_bytes:
             sig_file = st.file_uploader("Sube la firma (PNG/JPG)", type=["png", "jpg", "jpeg"], key="sig_uploader")
 
             # Controles firma
-            gap = st.slider("Espacio entre firma y nombre (gap)", 0, 40, 10, key="g
+            gap = st.slider("Espacio entre firma y nombre (gap)", 0, 40, 10, key="gap")
+            pad = st.slider("Margen (padding)", 0, 20, 6, key="pad")
+            scale_w = st.slider("Escala ancho firma", 0.8, 2.5, 1.4, 0.1, key="scale_w")
+            scale_h = st.slider("Escala alto firma", 0.8, 4.0, 2.0, 0.1, key="scale_h")
+
+            if sig_file:
+                sig_img = Image.open(sig_file).convert("RGBA")
+
+                st.subheader("✅ Preview con firma (firma arriba del nombre)")
+                st.image(
+                    draw_signature_preview_above(
+                        img_page, rect_pdf, sig_img,
+                        zoom=preview_zoom,
+                        gap=gap, pad=pad, scale_w=scale_w, scale_h=scale_h
+                    ),
+                    use_column_width=True
+                )
+
+                if st.button("🔒 Confirmar y generar PDF firmado", type="primary", key="confirm_sign"):
+                    doc2 = fitz.open(stream=merged_pdf_bytes, filetype="pdf")
+                    rect_pdf2 = fitz.Rect(*st.session_state.det_rect)
+
+                    insert_signature_above_into_pdf(
+                        doc2,
+                        st.session_state.det_page,
+                        rect_pdf2,
+                        sig_file.getvalue(),
+                        gap=gap, pad=pad, scale_w=scale_w, scale_h=scale_h
+                    )
+
+                    out = io.BytesIO()
+                    doc2.save(out)
+                    doc2.close()
+                    out.seek(0)
+
+                    st.success("PDF firmado generado ✅")
+                    st.download_button(
+                        "⬇️ Descargar PDF unido y firmado",
+                        data=out,
+                        file_name="PDF_unido_firmado.pdf",
+                        mime="application/pdf",
+                        key="dl_signed"
+                    )
+            else:
+                st.warning("Sube la imagen de firma para previsualizar y confirmar.")
+        doc.close()
+else:
+    st.info("Sube PDFs y haz clic en **Unir PDFs** para continuar.")
